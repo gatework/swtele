@@ -69,6 +69,8 @@ type portKey struct {
 
 // infraCapabilities are LLDP/CDP capabilities of network devices; a port
 // facing one is infrastructure even when the device is not in the ledger.
+// infraCapabilities name network devices; "s" is the CDP Switch code
+// (LLDP Station is handled by hostAdapter).
 var infraCapabilities = []string{"bridge", "router", "switch", "b", "r", "s"}
 
 // Build derives the graph of l.
@@ -82,6 +84,7 @@ func Build(l *ledger.Ledger) *Graph {
 		}
 		markStack(g, d)
 	}
+	g.Links = dedupe(g.Links)
 	slices.SortFunc(g.Links, func(a, b Link) int {
 		return cmp.Or(a.A.Device.Identity.Mgmt.Compare(b.A.Device.Identity.Mgmt), cmp.Compare(a.A.Port, b.A.Port))
 	})
@@ -122,6 +125,67 @@ func sharedSegments(l *ledger.Ledger, d *swtele.Device) func(swtele.Neighbor) bo
 	}
 }
 
+// remotePort resolves a port ID advertised as a MAC address (Comware
+// management ports, some servers) to the remote interface owning it.
+func remotePort(remote *swtele.Device, port string) string {
+	mac, err := swtele.ParseMAC(port)
+	if err != nil {
+		return port
+	}
+	for _, i := range remote.Interfaces.All() {
+		if i.MAC == mac && (i.Kind == swtele.KindPhysical || i.Kind == swtele.KindMgmt) {
+			return i.Name
+		}
+	}
+	return port
+}
+
+// stateRank orders link states from best to worst.
+var stateRank = map[State]int{Confirmed: 0, OneWay: 1, Shared: 2, Unmanaged: 3}
+
+// dedupe keeps one link per local port and managed remote device: a
+// neighbor seen through several advertisements (LLDP agents, CDP, a port
+// ID given once by name and once by MAC) is one cable, recorded with its
+// best state.
+func dedupe(links []Link) []Link {
+	type key struct {
+		dev  *swtele.Device
+		port string
+		far  *swtele.Device
+	}
+	best := map[key]int{}
+	keys := func(l Link) []key {
+		if l.B.Device == nil {
+			return nil
+		}
+		return []key{{l.A.Device, swtele.InterfaceKey(l.A.Port), l.B.Device}, {l.B.Device, swtele.InterfaceKey(l.B.Port), l.A.Device}}
+	}
+	for _, l := range links {
+		for _, k := range keys(l) {
+			if r, ok := best[k]; !ok || stateRank[l.State] < r {
+				best[k] = stateRank[l.State]
+			}
+		}
+	}
+	out := links[:0]
+	kept := map[key]bool{}
+	for _, l := range links {
+		ks := keys(l)
+		if len(ks) == 0 {
+			out = append(out, l)
+			continue
+		}
+		// The local end decides; a one-way record from the far end of a
+		// confirmed cable is the same cable.
+		if stateRank[l.State] > best[ks[0]] || kept[ks[0]] {
+			continue
+		}
+		kept[ks[0]], kept[ks[1]] = true, true
+		out = append(out, l)
+	}
+	return out
+}
+
 // remoteID identifies the system behind an advertisement.
 func remoteID(l *ledger.Ledger, n swtele.Neighbor) string {
 	if d := l.Remote(n); d != nil {
@@ -134,12 +198,45 @@ func remoteID(l *ledger.Ledger, n swtele.Neighbor) string {
 }
 
 func networkDevice(n swtele.Neighbor) bool {
+	if hostAdapter(n) {
+		return false
+	}
 	for _, c := range n.Capabilities {
 		if slices.Contains(infraCapabilities, strings.ToLower(strings.TrimSpace(c))) {
 			return true
 		}
 	}
 	return n.Platform != "" && !strings.Contains(strings.ToLower(n.Platform), "phone")
+}
+
+// hostAdapter reports a server NIC speaking LLDP: firmware agents
+// advertise the adapter model, not a network platform.
+func hostAdapter(n swtele.Neighbor) bool {
+	// IP phones bridge the PC behind them but are endpoints.
+	if slices.ContainsFunc(n.Capabilities, func(c string) bool {
+		c = strings.ToLower(strings.TrimSpace(c))
+		return c == "telephone" || c == "phone" || strings.EqualFold(n.Protocol, "lldp") && c == "t"
+	}) && !slices.ContainsFunc(n.Capabilities, func(c string) bool { return strings.EqualFold(strings.TrimSpace(c), "router") }) {
+		return true
+	}
+	// LLDP "S" is Station (CDP "S" is Switch): a neighbor advertising
+	// only that is an end host.
+	if strings.EqualFold(n.Protocol, "lldp") && len(n.Capabilities) > 0 && !slices.ContainsFunc(n.Capabilities, func(c string) bool {
+		c = strings.ToLower(strings.TrimSpace(c))
+		return c != "s" && c != "station" && c != "station only"
+	}) {
+		return true
+	}
+	desc := strings.ToLower(n.System + " " + n.Platform + " " + n.SysDesc)
+	for _, k := range []string{"adapter", "ethernet controller", "network connection", "converged network", " nic "} {
+		if strings.Contains(desc, k) {
+			return !slices.ContainsFunc(n.Capabilities, func(c string) bool {
+				c = strings.ToLower(strings.TrimSpace(c))
+				return c == "router" || c == "wlan access point"
+			})
+		}
+	}
+	return false
 }
 
 // advertises reports whether remote sees local on port.
@@ -274,6 +371,7 @@ func (g *Graph) add(l *ledger.Ledger, d *swtele.Device, n swtele.Neighbor, share
 		return
 	}
 	g.mark(d, n.LocalPort, RoleInfra)
+	n.Port = remotePort(remote, n.Port)
 	far := End{Device: remote, Port: n.Port}
 	if shared {
 		g.Links = append(g.Links, Link{A: local, B: far, State: Shared, Neighbor: n})

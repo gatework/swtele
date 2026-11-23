@@ -64,9 +64,13 @@ func Device(d *swtele.Device, o Options) Summary {
 			continue
 		}
 		s.Physical++
+		shut := false
+		if c := d.Config.Port(i.Name); c != nil {
+			shut = c.Shutdown.Or(false)
+		}
 		switch {
-		case i.Admin == swtele.StateDown:
-			s.Disabled++
+		case i.Admin == swtele.StateDown, shut:
+			s.Disabled++ // shut down on purpose: not a port to reclaim
 		case i.Up():
 			s.Up++
 			if h, ok := hot(i, o.HotPercent); ok {

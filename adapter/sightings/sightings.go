@@ -100,6 +100,20 @@ func (s *Store) Find(ctx context.Context, ip, mac string) ([]locate.Record, erro
 	return out, nil
 }
 
+// All returns every record, most recently seen first.
+func (s *Store) All(ctx context.Context) ([]locate.Record, error) {
+	all, err := s.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]locate.Record, 0, len(all))
+	for _, r := range all {
+		out = append(out, *r)
+	}
+	slices.SortFunc(out, func(a, b locate.Record) int { return b.Last.Compare(a.Last) })
+	return out, nil
+}
+
 func (s *Store) load(ctx context.Context) (map[string]*locate.Record, error) {
 	var list []*locate.Record
 	err := s.root.ReadJSON(ctx, file, limit, &list)

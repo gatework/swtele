@@ -8,6 +8,7 @@ import (
 	"github.com/gatework/netops/assess"
 	"github.com/gatework/netops/device"
 	"github.com/gatework/netops/evidence"
+	"github.com/gatework/netops/set"
 
 	"github.com/gatework/swtele"
 	"github.com/gatework/swtele/check"
@@ -91,5 +92,77 @@ func TestInsufficientEvidence(t *testing.T) {
 	i.Optics = &swtele.Transceiver{Present: true, Lanes: []swtele.Lane{{Index: 1, RxPower: swtele.Reading{Value: swtele.Some(-40.0)}}}}
 	if got := run(t, d, nil); got["optics.rx_power"] != 0 {
 		t.Errorf("rule ran on partial evidence: %v", got)
+	}
+}
+
+func TestLinkConsistency(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(0, 0)
+	mk := func(name, mgmt, chassis string) *swtele.Device {
+		d := swtele.New(device.Device{Name: name, Mgmt: netip.MustParseAddr(mgmt)}, at)
+		d.Observe(swtele.DimInterfaces, evidence.StatusComplete)
+		d.Observe(swtele.DimNeighbors, evidence.StatusComplete)
+		m, _ := swtele.ParseMAC(chassis)
+		d.Stack = &swtele.Stack{Kind: swtele.StackIRF, MAC: m}
+		return d
+	}
+	a, b := mk("a", "192.0.2.1", "0000-0000-0a01"), mk("b", "192.0.2.2", "0000-0000-0b01")
+	vlans := func(lo, hi int) *set.Set[int] {
+		s := set.New[int]()
+		s.Add(lo, hi)
+		return s
+	}
+	// Two members of one aggregate per side; the aggregates disagree on
+	// VLANs 30-40, and member 2 disagrees on MTU.
+	for _, x := range []struct {
+		d       *swtele.Device
+		agg     string
+		allowed *set.Set[int]
+	}{{a, "BAGG1", vlans(10, 40)}, {b, "BAGG9", vlans(10, 29)}} {
+		agg := x.d.Interfaces.Ensure(x.agg)
+		agg.Kind, agg.Oper = swtele.KindAggregate, swtele.StateUp
+		agg.Switching = &swtele.Switchport{Mode: swtele.ModeTrunk, Allowed: x.allowed}
+		for n, p := range []string{"XGE1/0/1", "XGE1/0/2"} {
+			i := x.d.Interfaces.Ensure(p)
+			i.Kind, i.Oper, i.Aggregate, i.MTU = swtele.KindPhysical, swtele.StateUp, x.agg, swtele.Some(1500)
+			switch {
+			case x.d == b && n == 1:
+				i.MTU = swtele.Some(9216) // non-jumbo 1500 facing jumbo: reported
+			case x.d == b:
+				i.MTU = swtele.Some(1518) // frame length vs MTU: tolerated
+			}
+		}
+	}
+	for _, p := range []string{"XGE1/0/1", "XGE1/0/2"} {
+		a.Neighbors = append(a.Neighbors, swtele.Neighbor{LocalPort: p, System: "b", Port: p, ChassisMAC: b.Stack.MAC})
+		b.Neighbors = append(b.Neighbors, swtele.Neighbor{LocalPort: p, System: "a", Port: p, ChassisMAC: a.Stack.MAC})
+	}
+	cat, err := check.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := assess.NewEngine(cat, assess.Policy{}, assess.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := ledger.New("t", at, []*swtele.Device{a, b})
+	g := topology.Build(l)
+	got := map[assess.RuleID][]assess.Finding{}
+	for _, d := range []*swtele.Device{a, b} {
+		res, err := eng.Run(t.Context(), &check.Target{Ledger: l, Graph: g, Device: d}, d.Coverage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range res.Findings {
+			got[f.Rule] = append(got[f.Rule], f)
+		}
+	}
+	if fs := got["link.allowed_vlans"]; len(fs) != 1 || fs[0].Subject.String() != "device:a/interface:BAGG1" {
+		t.Errorf("allowed vlans %+v", fs)
+	} else if fs[0].Detail != "对端 b BAGG9；仅本端允许 30-40" {
+		t.Errorf("detail %q", fs[0].Detail)
+	}
+	if fs := got["link.mtu_mismatch"]; len(fs) != 1 {
+		t.Errorf("mtu %+v", fs)
 	}
 }

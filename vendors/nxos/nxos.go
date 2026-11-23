@@ -12,6 +12,7 @@ import (
 
 	"github.com/gatework/netops/capture"
 	"github.com/gatework/netops/device"
+	"github.com/gatework/netops/evidence"
 
 	"github.com/gatework/swtele"
 	"github.com/gatework/swtele/vendors/internal/clidoc"
@@ -98,6 +99,9 @@ func Decode(ctx context.Context, id device.Device, c capture.Capture, o Options)
 
 // Commands returns every command the decoder understands, in order.
 func Commands() []string { return clidoc.Commands(steps) }
+
+// Feeds returns the dimensions command feeds.
+func Feeds(command string) []evidence.Dimension { return clidoc.Feeds(steps, command) }
 
 var shortName = regexp.MustCompile(`^([A-Za-z-]+)(\d.*)$`)
 

@@ -3,6 +3,7 @@ package clidoc
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/gatework/netops/capture"
@@ -69,6 +70,7 @@ func run[S any](ctx context.Context, dev *swtele.Device, name string, out captur
 	status, issues := doc.Finish()
 	for _, dim := range s.Dims {
 		dev.Observe(dim, status)
+		dev.Collect(dim, out.RecordedAt)
 	}
 	dev.Issues = append(dev.Issues, issues...)
 	if on != nil {
@@ -91,6 +93,21 @@ func Commands[S any](steps []Step[S]) []string {
 	out := make([]string, len(steps))
 	for i, s := range steps {
 		out[i] = s.Command
+	}
+	return out
+}
+
+// Feeds returns the dimensions the steps decode command into.
+func Feeds[S any](steps []Step[S], command string) []evidence.Dimension {
+	var out []evidence.Dimension
+	for _, s := range steps {
+		if s.Command == command || s.Prefix && strings.HasPrefix(command, s.Command) {
+			for _, d := range s.Dims {
+				if !slices.Contains(out, d) {
+					out = append(out, d)
+				}
+			}
+		}
 	}
 	return out
 }

@@ -15,10 +15,15 @@ import (
 	nboot "github.com/gatework/netops/bootstrap"
 	"github.com/gatework/netops/capture"
 	"github.com/gatework/netops/device"
+	"github.com/gatework/netops/event"
 	"github.com/gatework/netops/inventory"
+	"github.com/gatework/netops/lifecycle"
+	"github.com/gatework/netops/notify"
+	"github.com/gatework/netops/secret"
 
 	"github.com/gatework/swtele"
 	"github.com/gatework/swtele/adapter/backup"
+	"github.com/gatework/swtele/adapter/oui"
 	"github.com/gatework/swtele/adapter/sightings"
 	"github.com/gatework/swtele/adapter/snapshot"
 	"github.com/gatework/swtele/adapter/store"
@@ -63,9 +68,27 @@ type Config struct {
 	Workers       int    `yaml:"workers"`
 	DeviceTimeout string `yaml:"device_timeout"`
 	ExtraCommands bool   `yaml:"extra_commands"`
+	// Lifecycle is a netops lifecycle policy file: target and minimum
+	// releases, blocked releases, end-of-sale and end-of-support dates.
+	Lifecycle string `yaml:"lifecycle"`
+	// OUIFile is a local copy of the IEEE oui.txt registry, for endpoint
+	// vendor names.
+	OUIFile string `yaml:"oui_file"`
+	// Webhook receives watch events at or above a severity.
+	Webhook *Webhook `yaml:"webhook"`
 	// Watch: the schedule (cron or @every) and the events file.
 	Schedule   string `yaml:"schedule"`
 	EventsFile string `yaml:"events_file"`
+}
+
+// Webhook posts watch events as signed JSON.
+type Webhook struct {
+	URL string `yaml:"url"`
+	// SecretEnv names the variable (in ~/.gatework/.env or the process)
+	// holding the HMAC signing key; empty sends unsigned bodies.
+	SecretEnv string `yaml:"secret_env"`
+	// MinSeverity is the lowest severity posted (default medium).
+	MinSeverity string `yaml:"min_severity"`
 }
 
 // Resources are the wired dependencies of one run.
@@ -79,6 +102,14 @@ type Resources struct {
 	ConfigsDir string
 	// EventsFile receives watch events, "" when none.
 	EventsFile string
+	// Location is the operators' zone for displaying times.
+	Location *time.Location
+	// OUI maps "aa:bb:cc" to the organization, empty without oui_file.
+	OUI map[string]string
+	// Lifecycle is the software lifecycle policy, nil without one.
+	Lifecycle *lifecycle.Policy
+	// Routes deliver watch events: the events file and the webhook.
+	Routes []event.Route
 }
 
 // Load reads the configuration and wires the workflow.
@@ -110,7 +141,12 @@ func Load(ctx context.Context, env nboot.Env, explicit string) (*Resources, erro
 		// directory; refuse rather than scatter batches there.
 		return nil, ErrNoDataDir
 	}
-	r := &Resources{Config: cfg, Path: path, Data: data, ConfigsDir: resolve(cfg.Configs), EventsFile: resolve(cfg.EventsFile)}
+	hours := 8
+	if cfg.Timezone != nil {
+		hours = *cfg.Timezone
+	}
+	r := &Resources{Config: cfg, Path: path, Data: data, ConfigsDir: resolve(cfg.Configs), EventsFile: resolve(cfg.EventsFile),
+		Location: time.FixedZone(fmt.Sprintf("UTC%+d", hours), hours*3600)}
 	app, err := newApp(cfg, data)
 	if err != nil {
 		return nil, err
@@ -124,6 +160,19 @@ func Load(ctx context.Context, env nboot.Env, explicit string) (*Resources, erro
 	if cfg.Policy != "" {
 		if r.Policy, err = loadPolicy(ctx, resolve(cfg.Policy)); err != nil {
 			return nil, err
+		}
+	}
+	if cfg.Lifecycle != "" {
+		if r.Lifecycle, err = loadLifecycle(ctx, resolve(cfg.Lifecycle)); err != nil {
+			return nil, err
+		}
+	}
+	if r.Routes, err = routes(ctx, cfg, r.EventsFile, path, env.Environ); err != nil {
+		return nil, err
+	}
+	if cfg.OUIFile != "" {
+		if r.OUI, err = oui.ReadFile(resolve(cfg.OUIFile)); err != nil {
+			return nil, fmt.Errorf("bootstrap: %w", err)
 		}
 	}
 	return r, nil
@@ -149,7 +198,8 @@ func newApp(cfg Config, data string) (*workflow.App, error) {
 	}
 	app := &workflow.App{
 		Ledgers: st, History: hist, Keep: time.Duration(keep) * 24 * time.Hour, Retain: 30,
-		Decoder: decoder{loc: time.FixedZone(fmt.Sprintf("UTC%+d", hours), hours*3600)},
+		Decoder:    decoder{loc: time.FixedZone(fmt.Sprintf("UTC%+d", hours), hours*3600)},
+		OpenSource: Source,
 	}
 	if cfg.RetentionBatches != nil {
 		app.Retain = *cfg.RetentionBatches
@@ -179,7 +229,7 @@ func wireInventory(ctx context.Context, r *Resources, inventoryPath, configPath 
 	if err != nil {
 		return err
 	}
-	r.App.Collector = c
+	r.App.Collector, r.App.Refresher = c, c
 	return nil
 }
 
@@ -193,6 +243,59 @@ func loadPolicy(ctx context.Context, path string) (assess.Policy, error) {
 		return assess.Policy{}, fmt.Errorf("bootstrap: policy: %w", err)
 	}
 	return p, nil
+}
+
+// ErrWebhookSecret reports a webhook whose secret variable is unset.
+var ErrWebhookSecret = errors.New("bootstrap: webhook secret variable is not set")
+
+// routes wires the event sinks; nothing is sent until watch publishes.
+func routes(ctx context.Context, cfg Config, eventsFile, configPath string, environ map[string]string) ([]event.Route, error) {
+	var out []event.Route
+	if eventsFile != "" {
+		f, err := notify.NewFile(eventsFile)
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap: events: %w", err)
+		}
+		out = append(out, event.Route{Name: "file", Sink: f})
+	}
+	w := cfg.Webhook
+	if w == nil || w.URL == "" {
+		return out, nil
+	}
+	floor := assess.SeverityMedium
+	if w.MinSeverity != "" {
+		if err := floor.UnmarshalText([]byte(w.MinSeverity)); err != nil {
+			return nil, fmt.Errorf("bootstrap: webhook min_severity: %w", err)
+		}
+	}
+	o := notify.WebhookOptions{URL: w.URL}
+	if w.SecretEnv != "" {
+		env, err := nboot.LoadEnv(ctx, "", configPath, environ)
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap: %w", err)
+		}
+		if env[w.SecretEnv] == "" {
+			return nil, fmt.Errorf("%w: %s", ErrWebhookSecret, w.SecretEnv)
+		}
+		o.Secret = secret.New(env[w.SecretEnv])
+	}
+	hook, err := notify.NewWebhook(o)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: webhook: %w", err)
+	}
+	return append(out, event.Route{Name: "webhook", Filter: event.Filter{MinSeverity: floor}, Sink: hook}), nil
+}
+
+func loadLifecycle(ctx context.Context, path string) (*lifecycle.Policy, error) {
+	body, _, err := nboot.ReadFile(ctx, path, false)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: lifecycle: %w", err)
+	}
+	p, err := lifecycle.Decode(body)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: lifecycle: %w", err)
+	}
+	return &p, nil
 }
 
 // Source opens a snapshot directory.

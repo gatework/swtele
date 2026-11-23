@@ -6,20 +6,34 @@ package ledger
 
 import (
 	"net/netip"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/gatework/netops/device"
+	"github.com/gatework/netops/evidence"
+
 	"github.com/gatework/swtele"
 )
 
+// Refreshed records the devices and dimensions a refresh renewed.
+type Refreshed struct {
+	Hosts []string             `json:"hosts"`
+	Dims  []evidence.Dimension `json:"dims,omitempty"`
+}
+
 // Manifest describes one stored batch.
 type Manifest struct {
-	Schema  int       `json:"schema"`
-	Batch   string    `json:"batch"`
-	At      time.Time `json:"at"`
-	Source  string    `json:"source,omitempty"`
-	Devices []string  `json:"devices"`
+	Schema int       `json:"schema"`
+	Batch  string    `json:"batch"`
+	At     time.Time `json:"at"`
+	Source string    `json:"source,omitempty"`
+	// Parent is the batch a refresh derived this one from, and Refreshed
+	// what the refresh collected again.
+	Parent    string     `json:"parent,omitempty"`
+	Refreshed *Refreshed `json:"refreshed,omitempty"`
+	Devices   []string   `json:"devices"`
 	// Failed lists the hosts whose capture could not be decoded.
 	Failed []string `json:"failed,omitempty"`
 }
@@ -38,6 +52,9 @@ type Ledger struct {
 	arpMAC map[swtele.MAC][]ARPRef
 	macs   map[swtele.MAC][]MACRef
 	ports  map[portKey]int // MAC entries learned per port
+	router map[*swtele.Device]bool
+	// gateway are the devices other devices use as their default gateway.
+	gateway map[*swtele.Device]bool
 }
 
 type portKey struct {
@@ -63,12 +80,39 @@ func New(batch string, at time.Time, devices []*swtele.Device) *Ledger {
 		Batch: batch, At: at, devices: slices.Clone(devices),
 		byMgmt: map[netip.Addr]*swtele.Device{}, byName: map[string]*swtele.Device{}, byMAC: map[swtele.MAC]*swtele.Device{},
 		arp: map[netip.Addr][]ARPRef{}, arpMAC: map[swtele.MAC][]ARPRef{}, macs: map[swtele.MAC][]MACRef{}, ports: map[portKey]int{},
+		router: map[*swtele.Device]bool{}, gateway: map[*swtele.Device]bool{},
 	}
 	slices.SortFunc(l.devices, func(a, b *swtele.Device) int { return a.Identity.Mgmt.Compare(b.Identity.Mgmt) })
 	for _, d := range l.devices {
 		l.index(d)
 	}
+	l.findRouters()
+	l.enrichModels()
 	return l
+}
+
+// DefaultGateway reports whether other devices route by default through d.
+func (l *Ledger) DefaultGateway(d *swtele.Device) bool { return l.gateway[d] }
+
+// Router reports whether d routes for endpoints: it has at least two
+// addressed layer-3 interfaces besides management and loopbacks, or other
+// devices use one of its addresses as their default gateway. An access
+// switch with only its management SVI is not one, although it holds ARP
+// entries for its management subnet.
+func (l *Ledger) Router(d *swtele.Device) bool { return l.router[d] }
+
+var modelLine = regexp.MustCompile(`^(?:H3C|HPE|Huawei|Ruijie|Cisco)\s+(\S+)$`)
+
+func modelOf(n swtele.Neighbor) string {
+	if n.Platform != "" {
+		return strings.TrimPrefix(n.Platform, "cisco ")
+	}
+	for line := range strings.SplitSeq(n.SysDesc, "\n") {
+		if m := modelLine.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 // NameKey normalizes a host name for matching: lowercase, without a
@@ -168,6 +212,77 @@ type Gateway struct {
 	Device    *swtele.Device
 	Interface *swtele.Interface
 	Prefix    netip.Prefix
+}
+
+// Select returns the devices sel matches, in address order. Names match
+// the inventory name and the hostname; without an inventory, role and
+// site are empty and only addresses and names select.
+func (l *Ledger) Select(sel device.Selector) []*swtele.Device {
+	if sel.Empty() {
+		return l.Devices()
+	}
+	var out []*swtele.Device
+	for _, d := range l.devices {
+		id := d.Identity
+		if id.ID == "" {
+			id.ID = id.Mgmt.String()
+		}
+		names := []string{id.Name, d.System.Hostname}
+		for _, n := range names {
+			id.Name = n
+			if sel.Match(id) {
+				out = append(out, d)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func (l *Ledger) findRouters() {
+	for _, d := range l.devices {
+		n := 0
+		for _, i := range d.Interfaces.All() {
+			if len(i.Addresses) > 0 && i.Kind != swtele.KindMgmt && i.Kind != swtele.KindLoopback && i.VRF != "management" {
+				n++
+			}
+		}
+		if n >= 2 {
+			l.router[d] = true
+		}
+		if d.Config == nil {
+			continue
+		}
+		for _, r := range d.Config.Static {
+			if r.Prefix.Bits() != 0 {
+				continue
+			}
+			for _, hop := range r.NextHops {
+				if a, err := netip.ParseAddr(hop); err == nil {
+					if gw := l.byMgmt[a]; gw != nil {
+						l.router[gw], l.gateway[gw] = true, true
+					}
+				}
+			}
+		}
+	}
+}
+
+// enrichModels fills the model of devices that did not report one from
+// what their neighbors were told: the CDP platform, or the model line of
+// an LLDP system description ("H3C S5130S-52S-EI").
+func (l *Ledger) enrichModels() {
+	for _, d := range l.devices {
+		for _, n := range d.Neighbors {
+			r := l.Remote(n)
+			if r == nil || r == d || r.System.Model != "" {
+				continue
+			}
+			if m := modelOf(n); m != "" {
+				r.System.Model, r.System.ModelFrom = m, "neighbor"
+			}
+		}
+	}
 }
 
 func (l *Ledger) index(d *swtele.Device) {

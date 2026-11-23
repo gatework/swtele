@@ -13,6 +13,7 @@ import (
 
 	"github.com/gatework/netops/capture"
 	"github.com/gatework/netops/device"
+	"github.com/gatework/netops/evidence"
 	"github.com/gatework/netops/set"
 
 	"github.com/gatework/swtele"
@@ -73,6 +74,9 @@ func Decode(ctx context.Context, id device.Device, c capture.Capture, o Options)
 
 // Commands returns every command the decoder understands.
 func Commands() []string { return clidoc.Commands(steps) }
+
+// Feeds returns the dimensions command feeds.
+func Feeds(command string) []evidence.Dimension { return clidoc.Feeds(steps, command) }
 
 func blank(s string) bool { return strings.TrimSpace(s) == "" }
 
