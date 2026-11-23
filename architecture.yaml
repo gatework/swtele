@@ -1,0 +1,89 @@
+# Package layering (STANDARD.md ARC-1), checked by archcheck in `make check`.
+# Direction: cmd -> internal/cli -> internal/bootstrap -> internal/workflow
+# -> analyses (ledger, topology, locate, check) -> root model <- vendors.
+declared:
+  - .
+  - ./ledger
+  - ./topology
+  - ./locate
+  - ./check
+  - ./vendors
+  - ./vendors/comware
+  - ./vendors/nxos
+  - ./vendors/hillstone
+  - ./vendors/alteon
+  - ./vendors/panos
+  - ./vendors/ios
+  - ./vendors/internal/clidoc
+  - ./adapter/store
+  - ./adapter/snapshot
+  - ./adapter/backup
+  - ./adapter/sightings
+  - ./delta
+  - ./capacity
+  - ./internal/workflow
+  - ./internal/bootstrap
+  - ./internal/cli
+  - ./internal/corpus
+  - ./cmd/swtele
+
+rules:
+  - name: the root model depends only on netops value packages
+    packages: [.]
+    deny: [./..., github.com/gatework/netops/ops/..., github.com/gatework/netops/store/...,
+           github.com/gatework/netops/inventory/..., github.com/gatework/netops/bootstrap/...]
+
+  - name: domain packages do no I/O
+    packages: [., ./ledger/..., ./topology/..., ./locate/..., ./check/..., ./delta/..., ./capacity/..., ./vendors/..., ./internal/workflow/...]
+    deny: [os, os/exec, io/fs, net, net/http/..., database/sql/..., path/filepath, syscall,
+           github.com/gatework/netops/store/..., github.com/gatework/netops/inventory/...]
+
+  - name: the ledger reads the model only
+    packages: [./ledger/...]
+    only_local: [.]
+
+  - name: topology reads the ledger only
+    packages: [./topology/...]
+    only_local: [., ./ledger]
+
+  - name: location reads the ledger and topology only
+    packages: [./locate/...]
+    only_local: [., ./ledger, ./topology]
+
+  - name: checks read the model, never vendor syntax
+    packages: [./check/...]
+    only_local: [., ./ledger, ./topology]
+
+  - name: vendors decode syntax into the model and do not know each other
+    packages: [./vendors/comware/..., ./vendors/nxos/..., ./vendors/hillstone/..., ./vendors/alteon/..., ./vendors/panos/..., ./vendors/ios/...]
+    only_local: [., ./vendors/internal/clidoc]
+
+  - name: capacity reads the model only
+    packages: [./capacity/...]
+    only_local: [.]
+
+  - name: batch comparison reads the ledger only
+    packages: [./delta/...]
+    only_local: [., ./ledger]
+
+  - name: workflows use injected ports, not adapters or vendors
+    packages: [./internal/workflow/...]
+    only_local: [., ./ledger, ./topology, ./locate, ./check, ./delta, ./capacity]
+
+  - name: the command line does not reach adapters or vendors directly
+    packages: [./internal/cli/...]
+    deny: [./adapter/..., ./vendors/...]
+
+  - name: only bootstrap reaches the transport
+    packages: [., ./ledger/..., ./topology/..., ./locate/..., ./check/..., ./delta/..., ./vendors/..., ./adapter/..., ./internal/workflow/...]
+    deny: [github.com/gatework/net-connector/..., github.com/gatework/expect/...]
+    transitive: true
+
+  - name: the command line reaches the transport only through bootstrap
+    packages: [./internal/cli/...]
+    deny: [github.com/gatework/net-connector/..., github.com/gatework/expect/...]
+
+  - name: no retired kernels
+    packages: [./...]
+    deny: [github.com/gatework/go-expect/..., github.com/gatework/go-netops/..., github.com/gatework/parser/...]
+    transitive: true
