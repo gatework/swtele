@@ -24,11 +24,14 @@ func (u Unit) String() string {
 // System is the platform of a device: identity, CPU, memory and
 // environment.
 type System struct {
-	Hostname string             `json:"hostname,omitempty"`
-	Model    string             `json:"model,omitempty"`
-	Version  string             `json:"version,omitempty"`
-	Serial   string             `json:"serial,omitempty"`
-	Uptime   Opt[time.Duration] `json:"uptime,omitzero"`
+	Hostname string `json:"hostname,omitempty"`
+	Model    string `json:"model,omitempty"`
+	// ModelFrom tells where Model comes from when the device did not
+	// report it: "neighbor" when a neighbor's LLDP or CDP gave it.
+	ModelFrom string             `json:"model_from,omitempty"`
+	Version   string             `json:"version,omitempty"`
+	Serial    string             `json:"serial,omitempty"`
+	Uptime    Opt[time.Duration] `json:"uptime,omitzero"`
 	// Clock is the device's own time when observed.
 	Clock   Opt[time.Time] `json:"clock,omitzero"`
 	CPU     []CPULoad      `json:"cpu,omitempty"`

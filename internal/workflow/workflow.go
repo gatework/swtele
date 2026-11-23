@@ -18,12 +18,15 @@ import (
 	"github.com/gatework/netops/capture"
 	"github.com/gatework/netops/device"
 	"github.com/gatework/netops/evidence"
+	"github.com/gatework/netops/lifecycle"
 
 	"github.com/gatework/swtele"
 	"github.com/gatework/swtele/check"
 	"github.com/gatework/swtele/delta"
 	"github.com/gatework/swtele/ledger"
 	"github.com/gatework/swtele/locate"
+	"github.com/gatework/swtele/metrics"
+	"github.com/gatework/swtele/path"
 	"github.com/gatework/swtele/topology"
 )
 
@@ -52,7 +55,16 @@ type Ledgers interface {
 	Load(ctx context.Context, batch string) (*ledger.Ledger, ledger.Manifest, error)
 	Previous(batch string) (string, error)
 	Batches() ([]string, error)
+	Latest(ctx context.Context) (string, error)
+	Manifest(ctx context.Context, batch string) (ledger.Manifest, error)
 	Prune(ctx context.Context, keep int) (int, error)
+	// Metrics reads a batch's snapshot, failing for batches written
+	// before snapshots existed; SaveMetrics fills those in.
+	Metrics(ctx context.Context, batch string) (metrics.Snapshot, error)
+	SaveMetrics(ctx context.Context, m metrics.Snapshot) error
+	// SaveDerived writes a batch that is parent with fresh devices
+	// replaced (or added), refreshed for dims, and makes it the latest.
+	SaveDerived(ctx context.Context, parent ledger.Manifest, at time.Time, fresh []*swtele.Device, dims []evidence.Dimension) (ledger.Manifest, error)
 }
 
 // Inventory names the devices of a source: identity, platform, site.
@@ -65,6 +77,7 @@ type Inventory interface {
 type History interface {
 	Record(ctx context.Context, batch string, at time.Time, seen []locate.Sighting, keep time.Duration) ([]locate.Move, error)
 	Find(ctx context.Context, ip, mac string) ([]locate.Record, error)
+	All(ctx context.Context) ([]locate.Record, error)
 }
 
 // Collector fetches fresh captures from devices into a raw snapshot
@@ -112,7 +125,11 @@ type App struct {
 	Decoder   Decoder
 	Inventory Inventory
 	Collector Collector
-	Now       func() time.Time
+	// Refresher collects some dimensions again, nil without online
+	// collection; OpenSource reopens a batch's import source by name.
+	Refresher  Refresher
+	OpenSource func(name string) (Source, error)
+	Now        func() time.Time
 }
 
 // ImportResult summarizes an import.
@@ -200,6 +217,42 @@ func (a *App) Changes(ctx context.Context, from, to string) ([]delta.Change, str
 	return delta.Compare(prev, cur.Ledger), prev.Batch, cur.Ledger.Batch, nil
 }
 
+// Snapshots returns the metrics snapshots of the last n batches up to
+// and including batch ("" for the latest), oldest first. A batch without
+// a snapshot is loaded once and its snapshot written back.
+func (a *App) Snapshots(ctx context.Context, batch string, n int) ([]metrics.Snapshot, error) {
+	list, err := a.Ledgers.Batches()
+	if err != nil {
+		return nil, fmt.Errorf("workflow: %w", err)
+	}
+	if batch == "" {
+		if batch, err = a.Ledgers.Latest(ctx); err != nil {
+			return nil, fmt.Errorf("workflow: %w", err)
+		}
+	}
+	end := slices.Index(list, batch)
+	if end < 0 {
+		return nil, fmt.Errorf("workflow: unknown batch %s", batch)
+	}
+	list = list[max(0, end+1-n) : end+1]
+	out := make([]metrics.Snapshot, 0, len(list))
+	for _, b := range list {
+		m, err := a.Ledgers.Metrics(ctx, b)
+		if err != nil {
+			l, mf, lerr := a.Ledgers.Load(ctx, b)
+			if lerr != nil {
+				return nil, fmt.Errorf("workflow: %w", lerr)
+			}
+			m = metrics.From(b, mf.At, l.Devices())
+			if err := a.Ledgers.SaveMetrics(ctx, m); err != nil {
+				return nil, fmt.Errorf("workflow: %w", err)
+			}
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
 // ErrNoPrevious reports a comparison without an earlier batch.
 var ErrNoPrevious = errors.New("workflow: no previous batch")
 
@@ -257,10 +310,47 @@ func (v *View) Locate(query string, o locate.Options) locate.Location {
 	return locate.New(v.Ledger, v.Graph, o).Locate(query)
 }
 
+// Sightings returns the endpoints located on access ports.
+func (v *View) Sightings(o locate.Options) []locate.Sighting {
+	return locate.New(v.Ledger, v.Graph, o).Sightings()
+}
+
+// Lifecycle judges the software of devs under p.
+func (v *View) Lifecycle(p lifecycle.Policy, devs []*swtele.Device) map[*swtele.Device]lifecycle.Verdict {
+	out := make(map[*swtele.Device]lifecycle.Verdict, len(devs))
+	for _, d := range devs {
+		id := d.Identity.Clone()
+		id.Name = d.Name()
+		id.Version = cmp.Or(d.System.Version, id.Version)
+		id.Model = cmp.Or(d.System.Model, id.Model)
+		out[d] = p.Evaluate(id, v.Ledger.At)
+	}
+	return out
+}
+
+// Trace returns the layer-2 path between two endpoints.
+func (v *View) Trace(src, dst string, o locate.Options) path.Result {
+	return path.New(v.Ledger, v.Graph, locate.New(v.Ledger, v.Graph, o)).Trace(src, dst)
+}
+
 // DeviceAssessment is the assessment of one device.
 type DeviceAssessment struct {
 	Device     *swtele.Device
 	Assessment assess.Assessment
+}
+
+// AssessPrevious runs the risk catalog over the devices of the previous
+// batch that match devs by address, for comparing findings.
+func (v *View) AssessPrevious(ctx context.Context, policy assess.Policy, devs []*swtele.Device) ([]DeviceAssessment, error) {
+	if v.Prev == nil {
+		return nil, nil
+	}
+	want := map[netip.Addr]bool{}
+	for _, d := range devs {
+		want[d.Identity.Mgmt] = true
+	}
+	pv := &View{Ledger: v.Prev, Graph: topology.Build(v.Prev)}
+	return pv.Assess(ctx, policy, func(d *swtele.Device) bool { return want[d.Identity.Mgmt] })
 }
 
 // Assess runs the risk catalog under policy over every device matching

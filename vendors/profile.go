@@ -1,5 +1,11 @@
 package vendors
 
+import (
+	"slices"
+
+	"github.com/gatework/netops/evidence"
+)
+
 // profiles are the commands collected per decoder: every one ran on the
 // fleet when the corpus was recorded (2026-11-23), so it is known to be
 // accepted. display alarm* and show interface counters rates are left
@@ -75,6 +81,24 @@ func Profile(platform string, extra bool) []string {
 	out := append([]string(nil), profiles[name]...)
 	if extra {
 		out = append(out, extras[name]...)
+	}
+	return out
+}
+
+// CommandsFor returns the profile commands of platform that feed any of
+// dims (every profile command when dims is empty): what a refresh of
+// those dimensions collects.
+func CommandsFor(platform string, dims []evidence.Dimension, extra bool) []string {
+	all := Profile(platform, extra)
+	if len(dims) == 0 {
+		return all
+	}
+	name := aliases[platform]
+	var out []string
+	for _, c := range all {
+		if slices.ContainsFunc(feeds(name, c), func(d evidence.Dimension) bool { return slices.Contains(dims, d) }) {
+			out = append(out, c)
+		}
 	}
 	return out
 }

@@ -34,6 +34,8 @@ const (
 	GatewayOnly Confidence = "gateway_only"
 	// Unknown: neither ARP nor any forwarding table knows the endpoint.
 	Unknown Confidence = "unknown"
+	// Device: the address belongs to a network device of the ledger.
+	Device Confidence = "network_device"
 )
 
 // Options tune location.
@@ -76,10 +78,17 @@ type Location struct {
 	OUI        string     `json:"oui,omitempty"`
 	Confidence Confidence `json:"confidence"`
 	Gateways   []Gateway  `json:"gateways,omitempty"`
+	// Seen are the other devices holding an ARP entry for the IP, such as
+	// switches whose management SVI shares the subnet.
+	Seen []Gateway `json:"seen,omitempty"`
 	// Access is the edge port the endpoint attaches to.
 	Access []Port `json:"access,omitempty"`
 	// Path is every other port that learned it, upstream first.
 	Path []Port `json:"path,omitempty"`
+	// Device and Interface name the network device owning the address,
+	// when Confidence is Device.
+	Device    string `json:"device,omitempty"`
+	Interface string `json:"interface,omitempty"`
 	// Notes explain anomalies: IP conflicts, MAC on several edges.
 	Notes []string `json:"notes,omitempty"`
 }
@@ -109,22 +118,44 @@ func (x *Locator) Locate(query string) Location {
 		loc.MAC = mac
 		for _, r := range x.l.ARPByMAC(mac) {
 			loc.IP = r.Entry.IP
-			loc.Gateways = appendGateway(loc.Gateways, r)
+			x.addGateway(&loc, r)
 		}
 	} else {
 		loc.Notes = append(loc.Notes, "无法识别的 IP 或 MAC 地址")
 		return loc
 	}
+	x.pickGateways(&loc)
 	if loc.MAC.IsZero() {
 		return loc
 	}
 	loc.OUI = loc.MAC.OUI()
+	if x.device(&loc) {
+		return loc
+	}
 	x.place(&loc)
 	return loc
 }
 
+func hasAddr(i *swtele.Interface, ip netip.Addr) bool {
+	for _, a := range i.Addresses {
+		if a.Prefix.Addr() == ip {
+			return true
+		}
+	}
+	return false
+}
+
 func appendGateway(gs []Gateway, r ledger.ARPRef) []Gateway {
 	g := Gateway{Device: r.Device.Name(), Mgmt: r.Device.Identity.Mgmt.String(), Interface: r.Entry.Interface, VLAN: r.Entry.VLAN, VRF: r.Entry.VRF}
+	// Comware ARP tables name the port the entry was learned on; the
+	// gateway is the layer-3 interface whose subnet holds the address.
+	for _, i := range r.Device.Interfaces.All() {
+		for _, a := range i.Addresses {
+			if a.Prefix.Bits() < a.Prefix.Addr().BitLen() && a.Prefix.Masked().Contains(r.Entry.IP) {
+				g.Interface = i.Name
+			}
+		}
+	}
 	if i := r.Device.Interfaces.Get(r.Entry.Interface); i != nil && g.VRF == "" {
 		g.VRF = i.VRF
 	}
@@ -191,7 +222,7 @@ func (x *Locator) resolveIP(loc *Location) {
 			continue
 		}
 		macs[r.Entry.MAC] = true
-		loc.Gateways = appendGateway(loc.Gateways, r)
+		x.addGateway(loc, r)
 	}
 	switch len(macs) {
 	case 0:
@@ -272,7 +303,7 @@ func (x *Locator) place(loc *Location) {
 		loc.Access = behind[:1]
 		loc.Path = append(loc.Path, behind[1:]...)
 		loc.Notes = append(loc.Notes, fmt.Sprintf("终端位于非受管设备 %s 之后", cmp.Or(behind[0].Neighbor, "（未通告邻居）")))
-	case len(loc.Gateways) > 0 || len(loc.Path) > 0:
+	case len(loc.Gateways) > 0 || len(loc.Seen) > 0 || len(loc.Path) > 0:
 		loc.Confidence = GatewayOnly
 		if len(loc.Path) > 0 {
 			loc.Notes = append(loc.Notes, "仅在设备互联端口上学到：接入层表项可能已老化，或终端位于台账外设备之后")
@@ -303,4 +334,58 @@ func (x *Locator) port(r ledger.MACRef) (Port, *swtele.Device) {
 	}
 	p.Role = string(role)
 	return p, far
+}
+
+// device answers for an address of a network device in the ledger: the
+// device itself, and the port its owning interface connects to.
+func (x *Locator) device(loc *Location) bool {
+	owner := x.l.Owner(loc.MAC)
+	if owner == nil && loc.IP.IsValid() {
+		owner = x.l.Device(loc.IP.String())
+	}
+	if owner == nil {
+		return false
+	}
+	loc.Confidence = Device
+	loc.Device = owner.Name()
+	for _, i := range owner.Interfaces.All() {
+		if i.MAC != loc.MAC && !hasAddr(i, loc.IP) {
+			continue
+		}
+		loc.Interface = i.Name
+		if e, ok := x.g.Peer(owner, i.Name); ok && e.Device != nil {
+			loc.Access = []Port{{Device: e.Device.Name(), Mgmt: e.Device.Identity.Mgmt.String(), Interface: e.Port, Role: string(x.g.Role(e.Device, e.Port)), Neighbor: owner.Name()}}
+		}
+		if i.Kind == swtele.KindPhysical || i.Kind == swtele.KindMgmt {
+			break
+		}
+	}
+	return true
+}
+
+// addGateway files an ARP holder as candidate gateway when it routes, as
+// a mere observer otherwise; pickGateways narrows the candidates.
+func (x *Locator) addGateway(loc *Location, r ledger.ARPRef) {
+	if x.l.Router(r.Device) {
+		loc.Gateways = appendGateway(loc.Gateways, r)
+	} else {
+		loc.Seen = appendGateway(loc.Seen, r)
+	}
+}
+
+// pickGateways keeps, when some candidates are default gateways of other
+// devices, only those: the switches of a management VLAN all route and
+// all hold its ARP entries, but only the core is their gateway.
+func (x *Locator) pickGateways(loc *Location) {
+	var gw, rest []Gateway
+	for _, g := range loc.Gateways {
+		if d := x.l.Device(g.Mgmt); d != nil && x.l.DefaultGateway(d) {
+			gw = append(gw, g)
+		} else {
+			rest = append(rest, g)
+		}
+	}
+	if len(gw) > 0 {
+		loc.Gateways, loc.Seen = gw, append(loc.Seen, rest...)
+	}
 }

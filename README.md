@@ -1,6 +1,6 @@
 # swtele
 
-swtele 是网络设备运行态台账。它解析 H3C Comware 与 Cisco NX-OS 的运行态回显，为每台设备建立厂商无关的对象模型，并在全网台账上提供以下功能：
+swtele 是网络设备运行态台账。它解析 H3C Comware、Cisco NX-OS、Cisco IOS-XE、Hillstone StoneOS、Radware Alteon 和 PAN-OS 的运行态回显，为每台设备建立厂商无关的对象模型，并在全网台账上提供以下功能：
 
 - IP/MAC 定位到接入端口
 - LLDP/CDP 拓扑
@@ -8,6 +8,16 @@ swtele 是网络设备运行态台账。它解析 H3C Comware 与 Cisco NX-OS �
 - 错包增长、端口抖动
 - CPU、内存、温度
 - IRF/MAD、聚合、STP 与路由邻居的风险发现
+
+## 安装
+
+使用 Go 1.26 或更高版本安装。
+
+```sh
+go install github.com/gatework/swtele/cmd/swtele@v0.1.0
+```
+
+## 使用
 
 ```
 swtele import ~/Documents/Snapshots/devices   # 导入快照，生成台账批次

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"time"
 
@@ -55,7 +56,10 @@ type collector struct {
 	extra   bool
 }
 
-var _ workflow.Collector = (*collector)(nil)
+var (
+	_ workflow.Collector = (*collector)(nil)
+	_ workflow.Refresher = (*collector)(nil)
+)
 
 // newCollector wires online collection of devices.
 func newCollector(cfg Config, env map[string]string, devices []device.Device, data string) (*collector, error) {
@@ -84,15 +88,17 @@ func newCollector(cfg Config, env map[string]string, devices []device.Device, da
 		timeout: duration(cfg.DeviceTimeout, 15*time.Minute), extra: cfg.ExtraCommands}, nil
 }
 
-// probes maps the per-command dimensions "c00", "c01"... to the profile
-// commands of each device's platform: one swtele dimension is fed by
-// several commands, so collection addresses commands directly.
-type probes struct{ extra bool }
+// probes maps the per-command dimensions "c00", "c01"... to the commands
+// of each device's platform: one swtele dimension is fed by several
+// commands, so collection addresses commands directly.
+type probes struct {
+	commands func(platform string) []string
+}
 
 func dimension(n int) evidence.Dimension { return evidence.Dimension(fmt.Sprintf("c%02d", n)) }
 
 func (p probes) Command(d device.Device, dim evidence.Dimension) (string, bool) {
-	cmds := vendors.Profile(d.Platform, p.extra)
+	cmds := p.commands(d.Platform)
 	for n, c := range cmds {
 		if dimension(n) == dim {
 			return c, true
@@ -106,6 +112,47 @@ func (c *collector) Collect(ctx context.Context, selectors []string) (workflow.C
 	if err != nil {
 		return workflow.CollectResult{}, err
 	}
+	return c.collect(ctx, targets, func(platform string) []string { return vendors.Profile(platform, c.extra) }, nil)
+}
+
+// Refresh collects, from hosts, the profile commands feeding dims only;
+// ops.Collect merges them into the raw store over the older outputs.
+// Hosts the inventory does not name cannot be dialed and are reported
+// failed.
+func (c *collector) Refresh(ctx context.Context, hosts []netip.Addr, dims []evidence.Dimension, seed workflow.Source) (workflow.CollectResult, error) {
+	want := map[netip.Addr]bool{}
+	for _, h := range hosts {
+		want[h] = true
+	}
+	var targets []device.Device
+	for _, d := range c.inv {
+		if want[d.Mgmt] && len(vendors.CommandsFor(d.Platform, dims, c.extra)) > 0 {
+			targets = append(targets, d)
+			delete(want, d.Mgmt)
+		}
+	}
+	var missing []string
+	for h := range want {
+		missing = append(missing, h.String())
+	}
+	if len(targets) == 0 {
+		return workflow.CollectResult{Devices: len(hosts), Failed: missing},
+			fmt.Errorf("%w: none of the devices is in the inventory with a supported platform", ErrCollect)
+	}
+	res, err := c.collect(ctx, targets, func(platform string) []string { return vendors.CommandsFor(platform, dims, c.extra) }, seed)
+	res.Devices += len(missing)
+	res.Failed = append(res.Failed, missing...)
+	return res, err
+}
+
+func (c *collector) Source() workflow.Source {
+	d, _ := snapshot.Open(c.rawDir)
+	return d
+}
+
+// collect runs ops.Collect of commands over targets, after seeding the
+// raw store from seed for hosts it does not hold yet.
+func (c *collector) collect(ctx context.Context, targets []device.Device, commands func(string) []string, seed workflow.Source) (workflow.CollectResult, error) {
 	// Refuse before dialing anything when a platform has no credentials:
 	// every device would fail authentication, and be contacted for it.
 	for _, d := range targets {
@@ -113,16 +160,27 @@ func (c *collector) Collect(ctx context.Context, selectors []string) (workflow.C
 			return workflow.CollectResult{}, fmt.Errorf("%w: platform %s", ErrNoCredentials, d.Platform)
 		}
 	}
+	if seed != nil {
+		for _, d := range targets {
+			if _, ok, err := c.raw.Load(ctx, d.Mgmt); err == nil && !ok {
+				if old, err := seed.Load(ctx, d.Mgmt); err == nil {
+					if err := c.raw.Save(ctx, old); err != nil {
+						return workflow.CollectResult{}, fmt.Errorf("%w: seed %s: %w", ErrCollect, d.Mgmt, err)
+					}
+				}
+			}
+		}
+	}
 	most := 0
 	for _, d := range targets {
-		most = max(most, len(vendors.Profile(d.Platform, c.extra)))
+		most = max(most, len(commands(d.Platform)))
 	}
 	dims := make([]evidence.Dimension, most)
 	for n := range dims {
 		dims[n] = dimension(n)
 	}
 	rep, err := ops.Collect(ctx, ops.CollectRequest{
-		Devices: targets, Dimensions: dims, Probes: probes{extra: c.extra},
+		Devices: targets, Dimensions: dims, Probes: probes{commands: commands},
 		Dialer: c.dialer, Snapshots: c.raw, Workers: c.workers, Timeout: c.timeout,
 	})
 	res := workflow.CollectResult{Devices: len(targets)}
@@ -137,11 +195,6 @@ func (c *collector) Collect(ctx context.Context, selectors []string) (workflow.C
 		return res, fmt.Errorf("%w: %w", ErrCollect, err)
 	}
 	return res, nil
-}
-
-func (c *collector) Source() workflow.Source {
-	d, _ := snapshot.Open(c.rawDir)
-	return d
 }
 
 func or[T comparable](v, def T) T {

@@ -65,7 +65,7 @@ func rxPower(in assess.Input[*Target]) []assess.Finding {
 				dir = "偏高（过载，短距链路宜加衰减器或换模块）"
 			}
 			f := finding(t, portSubject(t.Device, i.Name), "端口 up 但收光越限",
-				fmt.Sprintf("通道 %d 收光 %.2f dBm %s（%s）", l.Index, l.RxPower.Value.V, dir, lvl),
+				fmt.Sprintf("通道 %d 收光 %.2f dBm %s（%s）", l.Index, l.RxPower.Value.V, dir, levelName(lvl)),
 				field("rx_dbm", l.RxPower.Value.V), field("level", lvl), field("lane", l.Index))
 			f.Actual = fmt.Sprintf("%.2f dBm", l.RxPower.Value.V)
 			if lo, ok := l.RxPower.Th.LowWarn.Get(); ok {
@@ -94,7 +94,7 @@ func moduleHealth(in assess.Input[*Target]) []assess.Finding {
 		check := func(what string, r swtele.Reading, unit string) {
 			if lvl := r.Level(); lvl == swtele.LevelWarn || lvl == swtele.LevelAlarm {
 				out = append(out, finding(t, portSubject(t.Device, i.Name), what+"越限",
-					fmt.Sprintf("%s %.2f %s（%s）", what, r.Value.V, unit, lvl), field("level", lvl)))
+					fmt.Sprintf("%s %.2f %s（%s）", what, r.Value.V, unit, levelName(lvl)), field("level", lvl)))
 			}
 		}
 		check("模块温度", x.Temp, "°C")
@@ -226,4 +226,11 @@ func multimode(i *swtele.Interface) bool {
 		}
 	}
 	return false
+}
+
+func levelName(l swtele.Level) string {
+	if l == swtele.LevelAlarm {
+		return "告警"
+	}
+	return "预警"
 }

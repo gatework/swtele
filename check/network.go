@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gatework/netops/assess"
+	"github.com/gatework/netops/set"
 
 	"github.com/gatework/swtele"
 	"github.com/gatework/swtele/topology"
@@ -223,6 +224,14 @@ func linkRules() []rule {
 			Requires: dims(swtele.DimNeighbors, swtele.DimInterfaces),
 		}, pvidMismatch),
 		assess.Check(assess.Meta{
+			ID: "link.allowed_vlans", Title: "互联两端允许 VLAN 不一致", Severity: assess.SeverityMedium, Category: assess.CategoryConsistency,
+			Requires: dims(swtele.DimNeighbors, swtele.DimInterfaces),
+		}, allowedMismatch),
+		assess.Check(assess.Meta{
+			ID: "link.mtu_mismatch", Title: "互联两端 MTU 不一致", Severity: assess.SeverityLow, Category: assess.CategoryConsistency,
+			Requires: dims(swtele.DimNeighbors, swtele.DimInterfaces),
+		}, mtuMismatch),
+		assess.Check(assess.Meta{
 			ID: "link.one_way", Title: "邻居仅单向可见", Severity: assess.SeverityLow, Category: assess.CategoryConsistency,
 			Requires: dims(swtele.DimNeighbors),
 		}, oneWay),
@@ -293,4 +302,103 @@ func oneWay(in assess.Input[*Target]) []assess.Finding {
 		}
 	}
 	return out
+}
+
+// peers yields the confirmed links of t's device with both ports up,
+// once per link (from the lower-addressed end).
+func peers(t *Target, yield func(a, b *swtele.Interface, remote *swtele.Device)) {
+	for _, l := range t.Graph.LinksOf(t.Device) {
+		if l.State != topology.Confirmed || l.B.Device == nil || l.B.Device == t.Device {
+			continue
+		}
+		if t.Device.Identity.Mgmt.Compare(l.B.Device.Identity.Mgmt) > 0 {
+			continue
+		}
+		a, b := t.Device.Interfaces.Get(l.A.Port), l.B.Device.Interfaces.Get(l.B.Port)
+		if a == nil || b == nil || !a.Up() || !b.Up() {
+			continue
+		}
+		yield(a, b, l.B.Device)
+	}
+}
+
+// logical is the port that carries the switching settings: the
+// aggregate of a member.
+func logical(d *swtele.Device, i *swtele.Interface) *swtele.Interface {
+	if i.Aggregate != "" {
+		if agg := d.Interfaces.Get(i.Aggregate); agg != nil && agg.Switching != nil {
+			return agg
+		}
+	}
+	return i
+}
+
+func allowedMismatch(in assess.Input[*Target]) []assess.Finding {
+	t := in.Model
+	var out []assess.Finding
+	seen := map[[2]string]bool{}
+	peers(t, func(a, b *swtele.Interface, remote *swtele.Device) {
+		la, lb := logical(t.Device, a), logical(remote, b)
+		k := [2]string{la.Key(), remote.Name() + "|" + lb.Key()}
+		if seen[k] {
+			return // the other members of the same aggregate
+		}
+		seen[k] = true
+		sa, sb := la.Switching, lb.Switching
+		if sa == nil || sb == nil || sa.Mode != swtele.ModeTrunk || sb.Mode != swtele.ModeTrunk || sa.Allowed == nil || sb.Allowed == nil {
+			return
+		}
+		if sa.Allowed.Equal(sb.Allowed) {
+			return
+		}
+		onlyA, onlyB := sa.Allowed.Difference(sb.Allowed), sb.Allowed.Difference(sa.Allowed)
+		detail := fmt.Sprintf("对端 %s %s", remote.Name(), lb.Name)
+		if c := onlyA.Compact(); c != "" {
+			detail += "；仅本端允许 " + c
+		}
+		if c := onlyB.Compact(); c != "" {
+			detail += "；仅对端允许 " + c
+		}
+		f := finding(t, portSubject(t.Device, la.Name), "互联两端允许 VLAN 不一致", detail,
+			field("peer", remote.Name()), field("peer_port", lb.Name), field("only_local", onlyA.Compact()), field("only_remote", onlyB.Compact()))
+		f.Expected, f.Actual = sb.Allowed.Compact(), sa.Allowed.Compact()
+		f.Remediation = &assess.Remediation{Summary: "核对两端 trunk 允许列表，只在一端放行的 VLAN 在该链路上不通", Manual: true}
+		if onlyVLAN1(onlyA) && onlyVLAN1(onlyB) {
+			f.Severity = assess.SeverityLow // VLAN 1 removed on one end only: usually harmless
+		}
+		out = append(out, f)
+	})
+	return out
+}
+
+const (
+	jumbo       = 9000
+	headerSlack = 100
+)
+
+func mtuMismatch(in assess.Input[*Target]) []assess.Finding {
+	t := in.Model
+	var out []assess.Finding
+	peers(t, func(a, b *swtele.Interface, remote *swtele.Device) {
+		if a.Kind != swtele.KindPhysical || b.Kind != swtele.KindPhysical || !a.MTU.OK || !b.MTU.OK {
+			return
+		}
+		// Platforms report the frame length or the MTU, a few header
+		// bytes apart, and default jumbo limits differ by model: only a
+		// non-jumbo end facing a larger one drops traffic.
+		lo, hi := min(a.MTU.V, b.MTU.V), max(a.MTU.V, b.MTU.V)
+		if lo >= jumbo || hi-lo <= headerSlack {
+			return
+		}
+		out = append(out, finding(t, portSubject(t.Device, a.Name), "互联两端 MTU 不一致",
+			fmt.Sprintf("本端 %d，对端 %s %s 为 %d；大包会在较小一端被丢弃", a.MTU.V, remote.Name(), b.Name, b.MTU.V),
+			field("peer", remote.Name()), field("peer_port", b.Name)))
+	})
+	return out
+}
+
+// onlyVLAN1 reports a set that is empty or just VLAN 1.
+func onlyVLAN1(s *set.Set[int]) bool {
+	c := s.Compact()
+	return c == "" || c == "1"
 }

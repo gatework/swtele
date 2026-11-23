@@ -10,6 +10,7 @@ import (
 
 	"github.com/gatework/netops/capture"
 	"github.com/gatework/netops/device"
+	"github.com/gatework/netops/evidence"
 
 	"github.com/gatework/swtele"
 	"github.com/gatework/swtele/vendors/alteon"
@@ -123,6 +124,9 @@ func Decode(ctx context.Context, id device.Device, c capture.Capture, o Options)
 // "[sw1]", "sw1#" and "sw1(M)#" all name sw1.
 func Hostname(prompt string) string {
 	p := strings.TrimSpace(strings.ReplaceAll(prompt, "\x00", ""))
+	if strings.HasPrefix(p, ">>") {
+		return "" // Alteon menu prompts name the menu, not the device
+	}
 	p = strings.TrimPrefix(strings.TrimPrefix(p, "<"), "[")
 	p = strings.TrimRight(p, ">]#$ ")
 	if i := strings.Index(p, "("); i > 0 {
@@ -146,6 +150,25 @@ func Commands(name string) []string {
 		return panos.Commands()
 	case IOS:
 		return ios.Commands()
+	}
+	return nil
+}
+
+// feeds returns the dimensions a command of decoder name feeds.
+func feeds(name, command string) []evidence.Dimension {
+	switch name {
+	case Comware:
+		return comware.Feeds(command)
+	case NXOS:
+		return nxos.Feeds(command)
+	case Hillstone:
+		return hillstone.Feeds(command)
+	case Alteon:
+		return alteon.Feeds(command)
+	case PANOS:
+		return panos.Feeds(command)
+	case IOS:
+		return ios.Feeds(command)
 	}
 	return nil
 }

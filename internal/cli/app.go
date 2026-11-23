@@ -44,6 +44,8 @@ type app struct {
 	batch  string
 	json   bool
 	res    *bootstrap.Resources
+	// refresh holds the --refresh settings of the analysis commands.
+	refresh map[*cobra.Command]*refreshSpec
 }
 
 // Run executes args and returns the exit code.
@@ -76,12 +78,16 @@ func (a *app) root() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.config, "config", "", flagConfig)
 	root.PersistentFlags().StringVar(&a.batch, "batch", "", flagBatch)
 	root.PersistentFlags().BoolVar(&a.json, "json", false, flagJSON)
-	root.AddCommand(a.importCmd(), a.batchesCmd(), a.deviceCmd(), a.portCmd(), a.locateCmd(),
-		a.topologyCmd(), a.opticsCmd(), a.riskCmd(), a.reportCmd(), a.historyCmd(), a.diffCmd(), a.collectCmd(), a.watchCmd(),
-		a.capacityCmd(), a.rebuildCmd(),
-		a.ruleCmd("errors", "错包", shortErrors, "counters.", "capacity."),
-		a.ruleCmd("flap", "抖动", shortFlap, "flap."),
-		a.ruleCmd("health", "运行", shortHealth, "health.", "stack.", "lag.", "routing.", "stp."))
+	rf := a.refreshable
+	root.AddCommand(a.importCmd(), a.batchesCmd(),
+		rf(a.devicesCmd(), dimsAll, nil), rf(a.deviceCmd(), dimsAll, nil),
+		rf(a.portCmd(), dimsPorts, nil), rf(a.errorsCmd(), dimsErrors, nil), rf(a.opticsCmd(), dimsOptics, nil),
+		rf(a.locateCmd(), dimsLocate, endpointDevices), rf(a.endpointsCmd(), dimsLocate, nil), rf(a.pathCmd(), dimsLocate, endpointDevices),
+		rf(a.topologyCmd(), dimsTopology, neighbors), rf(a.discoverCmd(), dimsTopology, nil),
+		rf(a.riskCmd(), dimsAll, nil), a.reportCmd(), a.historyCmd(), a.diffCmd(), a.trendCmd(), a.collectCmd(), a.watchCmd(),
+		rf(a.capacityCmd(), dimsErrors, nil), a.assetsCmd(), a.rebuildCmd(),
+		rf(a.findingsCmd("flap [选择器...]", "抖动", shortFlap, []string{"flap."}, "  swtele flap role=core"), dimsFlap, nil),
+		rf(a.findingsCmd("health [选择器...]", "运行", shortHealth, []string{"health.", "stack.", "lag.", "routing.", "stp."}, "  swtele health --severity high"), dimsHealth, nil))
 	localize(root)
 	return root
 }

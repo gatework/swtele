@@ -13,7 +13,6 @@ import (
 	"github.com/gatework/netops/assess"
 	"github.com/gatework/netops/event"
 	"github.com/gatework/netops/job"
-	"github.com/gatework/netops/notify"
 	"github.com/gatework/netops/store/runs"
 	"github.com/gatework/netops/term"
 
@@ -130,16 +129,9 @@ func (a *app) watchCmd() *cobra.Command {
 	return cmd
 }
 
-// bus publishes events to the configured file, or discards them.
+// bus publishes events to the configured routes (events file, webhook).
 func (a *app) bus(r *bootstrap.Resources) (*event.Bus, error) {
-	if r.EventsFile == "" {
-		return event.NewBus()
-	}
-	f, err := notify.NewFile(r.EventsFile)
-	if err != nil {
-		return nil, err
-	}
-	return event.NewBus(event.Route{Name: "file", Sink: f})
+	return event.NewBus(r.Routes...)
 }
 
 // watchRun is one scheduled run: collect, import, assess, and publish the

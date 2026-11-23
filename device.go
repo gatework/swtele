@@ -54,6 +54,9 @@ type Device struct {
 	L3         Routing           `json:"l3"`
 	Neighbors  []Neighbor        `json:"neighbors,omitempty"`
 	Logs       []LogEvent        `json:"logs,omitempty"`
+	// Collected is when each dimension's outputs were recorded: the
+	// oldest output feeding it. A refresh renews some dimensions only.
+	Collected map[evidence.Dimension]time.Time `json:"collected,omitempty"`
 	// Config is the configured intent, when a configuration was read.
 	Config *DeviceConfig    `json:"config,omitempty"`
 	Issues []evidence.Issue `json:"issues,omitempty"`
@@ -84,6 +87,30 @@ func (d *Device) Observe(dim evidence.Dimension, status evidence.Status, issues 
 	}
 	d.Coverage = d.Coverage.With(dim, status)
 	d.Issues = append(d.Issues, issues...)
+}
+
+// Collect records that an output recorded at at fed dim, keeping the
+// oldest time.
+func (d *Device) Collect(dim evidence.Dimension, at time.Time) {
+	if at.IsZero() {
+		return
+	}
+	if d.Collected == nil {
+		d.Collected = map[evidence.Dimension]time.Time{}
+	}
+	if old, ok := d.Collected[dim]; !ok || at.Before(old) {
+		d.Collected[dim] = at.UTC()
+	}
+}
+
+// CollectedAt returns when dim was collected, falling back to the
+// device's observation time for batches decoded before per-dimension
+// times were kept.
+func (d *Device) CollectedAt(dim evidence.Dimension) time.Time {
+	if t, ok := d.Collected[dim]; ok {
+		return t
+	}
+	return d.Observed
 }
 
 // Usable reports whether every dimension was observed completely or

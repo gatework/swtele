@@ -44,6 +44,11 @@ func fleet() *ledger.Ledger {
 	core := sw("core", "192.0.2.1", "0000-0000-0c01")
 	access := sw("access", "192.0.2.2", "0000-0000-0a01")
 	port(core, "Ten-GigabitEthernet1/0/1", true)
+	for n, pfx := range []string{"192.0.2.1/26", "198.51.100.1/24"} {
+		svi := core.Interfaces.Ensure("Vlan-interface" + []string{"10", "20"}[n])
+		svi.Kind, svi.Oper = swtele.KindSVI, swtele.StateUp
+		svi.Addresses = []swtele.IfAddr{{Prefix: netip.MustParsePrefix(pfx), Primary: true}}
+	}
 	port(access, "Ten-GigabitEthernet1/0/49", true)
 	port(access, "GigabitEthernet1/0/5", true)
 	port(access, "GigabitEthernet1/0/7", true)
@@ -83,7 +88,7 @@ func TestLocate(t *testing.T) {
 	if pc.Confidence != locate.Exact || len(pc.Access) != 1 || pc.Access[0].Device != "access" || pc.Access[0].Interface != "GE1/0/5" {
 		t.Errorf("pc %+v", pc)
 	}
-	if len(pc.Gateways) != 1 || pc.Gateways[0].Device != "core" || len(pc.Path) != 1 || pc.Path[0].Device != "core" {
+	if len(pc.Gateways) != 1 || pc.Gateways[0].Device != "core" || pc.Gateways[0].Interface != "Vlan-interface10" || len(pc.Path) != 1 || pc.Path[0].Device != "core" {
 		t.Errorf("pc gateway/path %+v %+v", pc.Gateways, pc.Path)
 	}
 
